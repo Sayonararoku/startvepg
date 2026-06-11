@@ -32,9 +32,10 @@ jobs:
 
       - name: Generar epg.xml
         env:
+          # El token se obtiene solo (sesion de invitado). Estos secrets son OPCIONALES,
+          # solo por si algun dia quieres forzar un token/appId manual.
           STARTV_TOKEN: ${{ secrets.STARTV_TOKEN }}
           STARTV_APP_ID: ${{ secrets.STARTV_APP_ID }}
-          STARTV_LINEUP_ID: ${{ secrets.STARTV_LINEUP_ID }}
           EPG_DAYS: "7"
           EPG_OUTPUT: public/epg.xml
         run: python generate_epg.py
