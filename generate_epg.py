@@ -86,6 +86,20 @@ def normalize_token(raw):
     return "Bearer " + raw
 
 
+def token_expiry(token):
+    """Devuelve la fecha de expiracion del JWT, o None si no se puede leer."""
+    try:
+        import base64
+
+        payload_b64 = token.replace("Bearer ", "").split(".")[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        exp = payload.get("exp")
+        return datetime.fromtimestamp(int(exp), tz=timezone.utc) if exp else None
+    except Exception:
+        return None
+
+
 def auto_token():
     """Obtiene un token JWT fresco sin intervencion manual.
 
@@ -193,14 +207,23 @@ def build_programme_xml(channel_id, p):
 
 
 def main():
-    token = normalize_token(os.environ.get("STARTV_TOKEN", ""))
-    if token:
-        log("Usando token manual de STARTV_TOKEN.")
-    else:
+    # Usa el token manual (STARTV_TOKEN) SOLO si esta vigente; si esta vencido o no
+    # hay, cae automaticamente al token de sesion de invitado. Asi puedes dejar el
+    # secret viejo sin que nada se rompa cuando caduque.
+    manual = normalize_token(os.environ.get("STARTV_TOKEN", ""))
+    token = ""
+    if manual:
+        mexp = token_expiry(manual)
+        if mexp and mexp <= datetime.now(timezone.utc):
+            log("STARTV_TOKEN manual esta caducado; usando token automatico.")
+        else:
+            token = manual
+            log("Usando token manual de STARTV_TOKEN.")
+    if not token:
         log("Obteniendo token automatico (sesion de invitado)...")
         token = auto_token()
     if not token:
-        log("ERROR: no hay token (fallo el automatico y no hay STARTV_TOKEN).")
+        log("ERROR: no hay token (fallo el automatico y no hay STARTV_TOKEN valido).")
         sys.exit(1)
 
     if not APP_ID:
@@ -209,14 +232,7 @@ def main():
 
     exp = token_expiry(token)
     if exp:
-        now = datetime.now(timezone.utc)
-        left = exp - now
-        log(f"Token expira: {exp.isoformat()} (en {left})")
-        if left.total_seconds() < 0:
-            log("ERROR: el token ya esta caducado. Actualiza el secret STARTV_TOKEN.")
-            sys.exit(2)
-        if left.total_seconds() < 2 * 86400:
-            log("AVISO: el token caduca en menos de 2 dias.")
+        log(f"Token expira: {exp.isoformat()} (se regenera solo en cada corrida)")
 
     if not os.path.exists(CHANNELS_FILE):
         log(f"ERROR: no existe {CHANNELS_FILE}")
@@ -298,20 +314,6 @@ def main():
     if channels and len(failed) == len(channels):
         log("\nERROR: todos los canales fallaron. Revisa STARTV_TOKEN y STARTV_APP_ID.")
         sys.exit(3)
-
-
-def token_expiry(token):
-    """Devuelve la fecha de expiracion del JWT, o None si no se puede leer."""
-    try:
-        import base64
-
-        payload_b64 = token.replace("Bearer ", "").split(".")[1]
-        payload_b64 += "=" * (-len(payload_b64) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
-        exp = payload.get("exp")
-        return datetime.fromtimestamp(int(exp), tz=timezone.utc) if exp else None
-    except Exception:
-        return None
 
 
 if __name__ == "__main__":
