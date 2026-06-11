@@ -5,7 +5,7 @@ Pensado para correr en GitHub Actions, pero funciona igual en local.
 
 Configuracion por variables de entorno:
   STARTV_TOKEN     (obligatorio)  Token JWT. Acepta con o sin prefijo "Bearer ".
-  STARTV_APP_ID    (opcional)     Default: d47a651b-3842-46b1-9f2f-ac978a254b88
+  STARTV_APP_ID    (opcional)     UUID de sesion. Si se omite, se genera al azar.
   STARTV_LINEUP_ID (opcional)     Default: 2342
   EPG_DAYS         (opcional)     Dias de programacion a pedir. Default: 7
   EPG_OUTPUT       (opcional)     Ruta del XML de salida. Default: public/epg.xml
@@ -19,6 +19,7 @@ import json
 import os
 import sys
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from xml.sax.saxutils import escape as xml_escape
@@ -30,12 +31,15 @@ from urllib3.util.retry import Retry
 # Zona horaria de Mexico (UTC-6, sin horario de verano desde 2022).
 TZ = timezone(timedelta(hours=-6))
 
-APP_ID = os.environ.get("STARTV_APP_ID", "d47a651b-3842-46b1-9f2f-ac978a254b88")
-LINEUP_ID = os.environ.get("STARTV_LINEUP_ID", "2342")
-DAYS = int(os.environ.get("EPG_DAYS", "7"))
-OUTPUT = os.environ.get("EPG_OUTPUT", "public/epg.xml")
-CHANNELS_FILE = os.environ.get("EPG_CHANNELS", "channels_resumen.json")
-WORKERS = int(os.environ.get("EPG_WORKERS", "6"))
+# El appId de la URL del EPG es solo un UUID de sesion que el sitio web genera con
+# crypto.randomUUID(): NO esta atado al token. Si no se define STARTV_APP_ID,
+# generamos uno al azar (asi solo hay que renovar el token cuando caduque).
+APP_ID = os.environ.get("STARTV_APP_ID") or str(uuid.uuid4())
+LINEUP_ID = os.environ.get("STARTV_LINEUP_ID") or "2342"
+DAYS = int(os.environ.get("EPG_DAYS") or "7")
+OUTPUT = os.environ.get("EPG_OUTPUT") or "public/epg.xml"
+CHANNELS_FILE = os.environ.get("EPG_CHANNELS") or "channels_resumen.json"
+WORKERS = int(os.environ.get("EPG_WORKERS") or "6")
 PROXY = os.environ.get("EPG_PROXY", "").strip()
 PAGE_SIZE = 5000
 
@@ -199,6 +203,7 @@ def main():
     date_from = int(start_day.timestamp() * 1000)
     date_to = int(end_day.timestamp() * 1000)
 
+    log(f"appId: {APP_ID}  lineupId: {LINEUP_ID}")
     log(f"Canales: {len(channels)}")
     log(f"Rango EPG: {start_day} a {end_day} ({DAYS} dias)")
     log(f"Descargando con {WORKERS} workers...\n")
