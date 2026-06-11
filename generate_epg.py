@@ -5,7 +5,7 @@ Pensado para correr en GitHub Actions, pero funciona igual en local.
 
 Configuracion por variables de entorno:
   STARTV_TOKEN     (obligatorio)  Token JWT. Acepta con o sin prefijo "Bearer ".
-  STARTV_APP_ID    (opcional)     UUID de sesion. Si se omite, se genera al azar.
+  STARTV_APP_ID    (obligatorio)  UUID de sesion (va en la URL del request, junto al token).
   STARTV_LINEUP_ID (opcional)     Default: 2342
   EPG_DAYS         (opcional)     Dias de programacion a pedir. Default: 7
   EPG_OUTPUT       (opcional)     Ruta del XML de salida. Default: public/epg.xml
@@ -19,7 +19,6 @@ import json
 import os
 import sys
 import time
-import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from xml.sax.saxutils import escape as xml_escape
@@ -31,10 +30,10 @@ from urllib3.util.retry import Retry
 # Zona horaria de Mexico (UTC-6, sin horario de verano desde 2022).
 TZ = timezone(timedelta(hours=-6))
 
-# El appId de la URL del EPG es solo un UUID de sesion que el sitio web genera con
-# crypto.randomUUID(): NO esta atado al token. Si no se define STARTV_APP_ID,
-# generamos uno al azar (asi solo hay que renovar el token cuando caduque).
-APP_ID = os.environ.get("STARTV_APP_ID") or str(uuid.uuid4())
+# El appId es un UUID de sesion que el servidor VALIDA: tiene que ser el mismo que
+# acompania al token en la peticion del sitio web. No sirve uno aleatorio (da HTTP 406).
+# Se captura junto al token, en la misma URL del request del navegador.
+APP_ID = (os.environ.get("STARTV_APP_ID") or "").strip()
 LINEUP_ID = os.environ.get("STARTV_LINEUP_ID") or "2342"
 DAYS = int(os.environ.get("EPG_DAYS") or "7")
 OUTPUT = os.environ.get("EPG_OUTPUT") or "public/epg.xml"
@@ -174,6 +173,11 @@ def main():
         log("ERROR: falta la variable STARTV_TOKEN")
         sys.exit(1)
 
+    if not APP_ID:
+        log("ERROR: falta STARTV_APP_ID. Capturalo de la URL de la peticion 'epgcache'")
+        log("       en DevTools (el bloque despues de /list/), junto con el token.")
+        sys.exit(1)
+
     exp = token_expiry(token)
     if exp:
         now = datetime.now(timezone.utc)
@@ -261,9 +265,9 @@ def main():
         for f_ in failed:
             log(f"  - {f_}")
 
-    # Si TODOS fallaron, lo mas probable es token caducado/invalido: fallar el job.
+    # Si TODOS fallaron, lo mas probable es token/appId caducado o invalido: fallar el job.
     if channels and len(failed) == len(channels):
-        log("\nERROR: todos los canales fallaron. Revisa el token STARTV_TOKEN.")
+        log("\nERROR: todos los canales fallaron. Revisa STARTV_TOKEN y STARTV_APP_ID.")
         sys.exit(3)
 
 
