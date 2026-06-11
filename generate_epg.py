@@ -3,9 +3,12 @@
 
 Pensado para correr en GitHub Actions, pero funciona igual en local.
 
+El token se obtiene AUTOMATICAMENTE (sesion de invitado anonima): no hay que
+capturarlo ni renovarlo a mano. Solo si defines STARTV_TOKEN se usa ese en su lugar.
+
 Configuracion por variables de entorno:
-  STARTV_TOKEN     (obligatorio)  Token JWT. Acepta con o sin prefijo "Bearer ".
-  STARTV_APP_ID    (obligatorio)  UUID de sesion (va en la URL del request, junto al token).
+  STARTV_TOKEN     (opcional)     Token JWT manual. Si se omite, se genera solo.
+  STARTV_APP_ID    (opcional)     UUID de sesion. Default ya incluido; se valida en server.
   STARTV_LINEUP_ID (opcional)     Default: 2342
   EPG_DAYS         (opcional)     Dias de programacion a pedir. Default: 7
   EPG_OUTPUT       (opcional)     Ruta del XML de salida. Default: public/epg.xml
@@ -27,13 +30,18 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# El guest-session/settings usan certis que conviene no verificar; silenciamos el aviso.
+requests.packages.urllib3.disable_warnings()
+
 # Zona horaria de Mexico (UTC-6, sin horario de verano desde 2022).
 TZ = timezone(timedelta(hours=-6))
 
-# El appId es un UUID de sesion que el servidor VALIDA: tiene que ser el mismo que
-# acompania al token en la peticion del sitio web. No sirve uno aleatorio (da HTTP 406).
-# Se captura junto al token, en la misma URL del request del navegador.
-APP_ID = (os.environ.get("STARTV_APP_ID") or "").strip()
+# El appId es un UUID de sesion que el servidor VALIDA (un random da HTTP 406).
+# Este valor esta registrado en la plataforma y funciona con el token anonimo;
+# es estable. Si algun dia deja de servir, capturar uno nuevo de DevTools y ponerlo
+# en el secret STARTV_APP_ID.
+DEFAULT_APP_ID = "35f5f075-0233-4b89-a912-49d22fb6b3eb"
+APP_ID = (os.environ.get("STARTV_APP_ID") or DEFAULT_APP_ID).strip()
 LINEUP_ID = os.environ.get("STARTV_LINEUP_ID") or "2342"
 DAYS = int(os.environ.get("EPG_DAYS") or "7")
 OUTPUT = os.environ.get("EPG_OUTPUT") or "public/epg.xml"
@@ -43,6 +51,12 @@ PROXY = os.environ.get("EPG_PROXY", "").strip()
 PAGE_SIZE = 5000
 
 BASE = "https://edgelb.stargroup.com.mx:9443/xtv-ws-client/api/epgcache/list"
+
+# Para obtener el token automaticamente (sesion de invitado anonima):
+# settings.json trae un deviceToken anonimo (valido por anios); guest-session lo
+# canjea por un token JWT fresco que devuelve en el header Authorization.
+SETTINGS_URL = "https://edgelb.stargroup.com.mx/web/startv/settings.json"
+GUEST_SESSION_URL = "https://edgelb.stargroup.com.mx:4446/xtv-ws-client/api/v1/guest-session"
 
 HEADERS = {
     "Accept": "application/json, text/plain, */*",
@@ -72,18 +86,29 @@ def normalize_token(raw):
     return "Bearer " + raw
 
 
-def token_expiry(token):
-    """Devuelve la fecha de expiracion del JWT, o None si no se puede leer."""
-    try:
-        import base64
+def auto_token():
+    """Obtiene un token JWT fresco sin intervencion manual.
 
-        payload_b64 = token.replace("Bearer ", "").split(".")[1]
-        payload_b64 += "=" * (-len(payload_b64) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
-        exp = payload.get("exp")
-        return datetime.fromtimestamp(int(exp), tz=timezone.utc) if exp else None
-    except Exception:
-        return None
+    1) baja settings.json y saca el deviceToken anonimo (valido por anios),
+    2) lo canjea en guest-session por un token de sesion fresco,
+       que el servidor devuelve en el header 'Authorization'.
+    Devuelve el token normalizado ('Bearer ...') o "" si falla.
+    """
+    try:
+        sess = requests.Session()
+        sess.headers.update(HEADERS)
+        if PROXY:
+            sess.proxies.update({"http": PROXY, "https": PROXY})
+        st = sess.get(SETTINGS_URL, timeout=30, verify=False).json()
+        anon = st["anonymous-browsing"]["deviceToken"]
+        r = sess.get(
+            GUEST_SESSION_URL, params={"deviceToken": anon}, timeout=30, verify=False
+        )
+        token = r.headers.get("Authorization") or r.headers.get("authorization") or ""
+        return normalize_token(token)
+    except Exception as e:
+        log(f"AVISO: no se pudo obtener token automatico: {e}")
+        return ""
 
 
 def make_session(authorization):
@@ -169,13 +194,17 @@ def build_programme_xml(channel_id, p):
 
 def main():
     token = normalize_token(os.environ.get("STARTV_TOKEN", ""))
+    if token:
+        log("Usando token manual de STARTV_TOKEN.")
+    else:
+        log("Obteniendo token automatico (sesion de invitado)...")
+        token = auto_token()
     if not token:
-        log("ERROR: falta la variable STARTV_TOKEN")
+        log("ERROR: no hay token (fallo el automatico y no hay STARTV_TOKEN).")
         sys.exit(1)
 
     if not APP_ID:
-        log("ERROR: falta STARTV_APP_ID. Capturalo de la URL de la peticion 'epgcache'")
-        log("       en DevTools (el bloque despues de /list/), junto con el token.")
+        log("ERROR: falta STARTV_APP_ID y no hay default.")
         sys.exit(1)
 
     exp = token_expiry(token)
@@ -269,6 +298,20 @@ def main():
     if channels and len(failed) == len(channels):
         log("\nERROR: todos los canales fallaron. Revisa STARTV_TOKEN y STARTV_APP_ID.")
         sys.exit(3)
+
+
+def token_expiry(token):
+    """Devuelve la fecha de expiracion del JWT, o None si no se puede leer."""
+    try:
+        import base64
+
+        payload_b64 = token.replace("Bearer ", "").split(".")[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        exp = payload.get("exp")
+        return datetime.fromtimestamp(int(exp), tz=timezone.utc) if exp else None
+    except Exception:
+        return None
 
 
 if __name__ == "__main__":
