@@ -33,6 +33,8 @@ jobs:
       - name: Generar epg.xml
         env:
           STARTV_TOKEN: ${{ secrets.STARTV_TOKEN }}
+          STARTV_APP_ID: ${{ secrets.STARTV_APP_ID }}
+          STARTV_LINEUP_ID: ${{ secrets.STARTV_LINEUP_ID }}
           EPG_DAYS: "7"
           EPG_OUTPUT: public/epg.xml
         run: python generate_epg.py
