@@ -1,6 +1,13 @@
 name: Generar EPG StarTV
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - "generate_epg.py"
+      - "channels_resumen.json"
+      - "requirements.txt"
+      - ".github/workflows/epg.yml"
   schedule:
     # Cada 12 horas (06:00 y 18:00 UTC = 00:00 y 12:00 hora de Mexico)
     - cron: "0 6,18 * * *"
