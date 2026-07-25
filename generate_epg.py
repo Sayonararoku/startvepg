@@ -234,17 +234,18 @@ def main():
             log("STARTV_TOKEN manual esta caducado; se ignora.")
             manual_token = ""
 
-    token, appid, cache_base = manual_token, MANUAL_APP_ID, ""
-
-    # Si falta el token o el appId, se piden automaticamente (token + appId frescos).
-    if not token or not appid:
-        log("Obteniendo sesion automatica (token + appId)...")
-        a_token, a_appid, a_base = auto_session()
-        token = token or a_token
-        appid = appid or a_appid
-        cache_base = a_base
-    else:
-        log("Usando STARTV_TOKEN y STARTV_APP_ID manuales.")
+    # SIEMPRE se prefiere la sesion automatica (token + appId frescos). Los valores
+    # manuales (STARTV_TOKEN / STARTV_APP_ID) quedan solo como respaldo por si el auto
+    # falla; asi un secret viejo (appId caducado) no rompe nada.
+    log("Obteniendo sesion automatica (token + appId)...")
+    a_token, a_appid, a_base = auto_session()
+    token = a_token or manual_token
+    appid = a_appid or MANUAL_APP_ID
+    cache_base = a_base
+    if not a_token and manual_token:
+        log("Auto fallo; usando STARTV_TOKEN manual de respaldo.")
+    if not a_appid and MANUAL_APP_ID:
+        log("Auto fallo; usando STARTV_APP_ID manual de respaldo.")
 
     if not token:
         log("ERROR: no se pudo obtener el token (auto y manual fallaron).")
