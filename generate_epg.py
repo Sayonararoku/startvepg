@@ -3,18 +3,20 @@
 
 Pensado para correr en GitHub Actions, pero funciona igual en local.
 
-El token se obtiene AUTOMATICAMENTE (sesion de invitado anonima): no hay que
-capturarlo ni renovarlo a mano. Solo si defines STARTV_TOKEN se usa ese en su lugar.
+TODO es automatico: el script consigue solo el token de sesion Y el appId (que
+caduca cada ~dia). No hay que capturar ni renovar nada a mano. La cadena es:
+  settings.json (deviceToken anonimo) -> guest-session (token fresco)
+  -> login/cache/token (appId "uuid" + cacheUrl) -> epgcache/list.
 
-Configuracion por variables de entorno:
-  STARTV_TOKEN     (opcional)     Token JWT manual. Si se omite, se genera solo.
-  STARTV_APP_ID    (opcional)     UUID de sesion. Default ya incluido; se valida en server.
-  STARTV_LINEUP_ID (opcional)     Default: 2342
-  EPG_DAYS         (opcional)     Dias de programacion a pedir. Default: 7
-  EPG_OUTPUT       (opcional)     Ruta del XML de salida. Default: public/epg.xml
-  EPG_CHANNELS     (opcional)     Ruta del JSON de canales. Default: channels_resumen.json
-  EPG_WORKERS      (opcional)     Descargas en paralelo. Default: 6
-  EPG_PROXY        (opcional)     Proxy (ej: socks5://host:1080 o http://host:8080). Vacio = sin proxy.
+Configuracion por variables de entorno (todas OPCIONALES):
+  STARTV_TOKEN     Token JWT manual. Si se omite (o esta caducado), se genera solo.
+  STARTV_APP_ID    appId manual. Si se omite, se pide fresco en cada corrida.
+  STARTV_LINEUP_ID Default: 2342
+  EPG_DAYS         Dias de programacion a pedir. Default: 7
+  EPG_OUTPUT       Ruta del XML de salida. Default: public/epg.xml
+  EPG_CHANNELS     Ruta del JSON de canales. Default: channels_resumen.json
+  EPG_WORKERS      Descargas en paralelo. Default: 6
+  EPG_PROXY        Proxy (ej: socks5://host:1080). Vacio = sin proxy.
 """
 
 import gzip
@@ -36,12 +38,8 @@ requests.packages.urllib3.disable_warnings()
 # Zona horaria de Mexico (UTC-6, sin horario de verano desde 2022).
 TZ = timezone(timedelta(hours=-6))
 
-# El appId es un UUID de sesion que el servidor VALIDA (un random da HTTP 406).
-# Este valor esta registrado en la plataforma y funciona con el token anonimo;
-# es estable. Si algun dia deja de servir, capturar uno nuevo de DevTools y ponerlo
-# en el secret STARTV_APP_ID.
-DEFAULT_APP_ID = "35f5f075-0233-4b89-a912-49d22fb6b3eb"
-APP_ID = (os.environ.get("STARTV_APP_ID") or DEFAULT_APP_ID).strip()
+# appId manual opcional. Si se omite, se pide fresco (recomendado: dejarlo vacio).
+MANUAL_APP_ID = (os.environ.get("STARTV_APP_ID") or "").strip()
 LINEUP_ID = os.environ.get("STARTV_LINEUP_ID") or "2342"
 DAYS = int(os.environ.get("EPG_DAYS") or "7")
 OUTPUT = os.environ.get("EPG_OUTPUT") or "public/epg.xml"
@@ -50,13 +48,14 @@ WORKERS = int(os.environ.get("EPG_WORKERS") or "6")
 PROXY = os.environ.get("EPG_PROXY", "").strip()
 PAGE_SIZE = 5000
 
-BASE = "https://edgelb.stargroup.com.mx:9443/xtv-ws-client/api/epgcache/list"
-
-# Para obtener el token automaticamente (sesion de invitado anonima):
-# settings.json trae un deviceToken anonimo (valido por anios); guest-session lo
-# canjea por un token JWT fresco que devuelve en el header Authorization.
+# Endpoints para la sesion automatica.
 SETTINGS_URL = "https://edgelb.stargroup.com.mx/web/startv/settings.json"
-GUEST_SESSION_URL = "https://edgelb.stargroup.com.mx:4446/xtv-ws-client/api/v1/guest-session"
+AUTH_BASE = "https://edgelb.stargroup.com.mx:4446/xtv-ws-client/api"
+GUEST_SESSION_URL = AUTH_BASE + "/v1/guest-session"
+CACHE_TOKEN_URL = AUTH_BASE + "/login/cache/token"
+
+# Base del caché EPG (por si login/cache/token no trae cacheUrl).
+CACHE_BASE_DEFAULT = "https://edgelb.stargroup.com.mx:9443/xtv-ws-client"
 
 HEADERS = {
     "Accept": "application/json, text/plain, */*",
@@ -100,29 +99,49 @@ def token_expiry(token):
         return None
 
 
-def auto_token():
-    """Obtiene un token JWT fresco sin intervencion manual.
+def _auto_client():
+    sess = requests.Session()
+    sess.headers.update(HEADERS)
+    if PROXY:
+        sess.proxies.update({"http": PROXY, "https": PROXY})
+    return sess
 
-    1) baja settings.json y saca el deviceToken anonimo (valido por anios),
-    2) lo canjea en guest-session por un token de sesion fresco,
-       que el servidor devuelve en el header 'Authorization'.
-    Devuelve el token normalizado ('Bearer ...') o "" si falla.
+
+def auto_session():
+    """Cadena completa sin intervencion humana.
+
+    settings.json -> deviceToken anonimo (valido por anios)
+      -> guest-session -> token JWT fresco (en el header Authorization)
+      -> login/cache/token -> appId ("uuid") + cacheUrl (base del epgcache).
+    Devuelve (token, appid, cache_base). Cualquier campo puede venir vacio si falla.
     """
+    token, appid, cache_base = "", "", ""
     try:
-        sess = requests.Session()
-        sess.headers.update(HEADERS)
-        if PROXY:
-            sess.proxies.update({"http": PROXY, "https": PROXY})
-        st = sess.get(SETTINGS_URL, timeout=30, verify=False).json()
-        anon = st["anonymous-browsing"]["deviceToken"]
-        r = sess.get(
+        sess = _auto_client()
+        anon = sess.get(SETTINGS_URL, timeout=30, verify=False).json()
+        anon = anon["anonymous-browsing"]["deviceToken"]
+        gs = sess.get(
             GUEST_SESSION_URL, params={"deviceToken": anon}, timeout=30, verify=False
         )
-        token = r.headers.get("Authorization") or r.headers.get("authorization") or ""
-        return normalize_token(token)
+        token = normalize_token(
+            gs.headers.get("Authorization") or gs.headers.get("authorization") or ""
+        )
+        if not token:
+            log("AVISO: guest-session no devolvio token.")
+            return token, appid, cache_base
+        ct = sess.get(
+            CACHE_TOKEN_URL,
+            params={"timestamp": int(time.time() * 1000)},
+            headers={"Authorization": token},
+            timeout=30,
+            verify=False,
+        ).json()
+        tok = ct.get("token") or {}
+        appid = (tok.get("uuid") or "").strip()
+        cache_base = (tok.get("cacheUrl") or "").strip()
     except Exception as e:
-        log(f"AVISO: no se pudo obtener token automatico: {e}")
-        return ""
+        log(f"AVISO: fallo la sesion automatica: {e}")
+    return token, appid, cache_base
 
 
 def make_session(authorization):
@@ -145,14 +164,14 @@ def xmltv_time(ms):
     return datetime.fromtimestamp(int(ms) / 1000, tz=TZ).strftime("%Y%m%d%H%M%S %z")
 
 
-def fetch_channel(session, ch, date_from, date_to):
+def fetch_channel(session, ch, date_from, date_to, base, app_id):
     """Descarga los programas de un canal. Devuelve (channel, programs, error)."""
     channel_id = str(ch.get("contentId", ""))
     if not channel_id:
         return ch, [], "sin contentId"
 
     url = (
-        f"{BASE}/{APP_ID}/{channel_id}/{LINEUP_ID}"
+        f"{base}/api/epgcache/list/{app_id}/{channel_id}/{LINEUP_ID}"
         f"?page=0&size={PAGE_SIZE}&dateFrom={date_from}&dateTo={date_to}"
     )
     try:
@@ -207,28 +226,34 @@ def build_programme_xml(channel_id, p):
 
 
 def main():
-    # Usa el token manual (STARTV_TOKEN) SOLO si esta vigente; si esta vencido o no
-    # hay, cae automaticamente al token de sesion de invitado. Asi puedes dejar el
-    # secret viejo sin que nada se rompa cuando caduque.
-    manual = normalize_token(os.environ.get("STARTV_TOKEN", ""))
-    token = ""
-    if manual:
-        mexp = token_expiry(manual)
+    # Token manual (si esta vigente) y appId manual, ambos opcionales.
+    manual_token = normalize_token(os.environ.get("STARTV_TOKEN", ""))
+    if manual_token:
+        mexp = token_expiry(manual_token)
         if mexp and mexp <= datetime.now(timezone.utc):
-            log("STARTV_TOKEN manual esta caducado; usando token automatico.")
-        else:
-            token = manual
-            log("Usando token manual de STARTV_TOKEN.")
+            log("STARTV_TOKEN manual esta caducado; se ignora.")
+            manual_token = ""
+
+    token, appid, cache_base = manual_token, MANUAL_APP_ID, ""
+
+    # Si falta el token o el appId, se piden automaticamente (token + appId frescos).
+    if not token or not appid:
+        log("Obteniendo sesion automatica (token + appId)...")
+        a_token, a_appid, a_base = auto_session()
+        token = token or a_token
+        appid = appid or a_appid
+        cache_base = a_base
+    else:
+        log("Usando STARTV_TOKEN y STARTV_APP_ID manuales.")
+
     if not token:
-        log("Obteniendo token automatico (sesion de invitado)...")
-        token = auto_token()
-    if not token:
-        log("ERROR: no hay token (fallo el automatico y no hay STARTV_TOKEN valido).")
+        log("ERROR: no se pudo obtener el token (auto y manual fallaron).")
+        sys.exit(1)
+    if not appid:
+        log("ERROR: no se pudo obtener el appId (auto y manual fallaron).")
         sys.exit(1)
 
-    if not APP_ID:
-        log("ERROR: falta STARTV_APP_ID y no hay default.")
-        sys.exit(1)
+    base = (cache_base or CACHE_BASE_DEFAULT).rstrip("/")
 
     exp = token_expiry(token)
     if exp:
@@ -252,7 +277,8 @@ def main():
     date_from = int(start_day.timestamp() * 1000)
     date_to = int(end_day.timestamp() * 1000)
 
-    log(f"appId: {APP_ID}  lineupId: {LINEUP_ID}")
+    log(f"appId: {appid}  lineupId: {LINEUP_ID}")
+    log(f"cacheBase: {base}")
     log(f"Canales: {len(channels)}")
     log(f"Rango EPG: {start_day} a {end_day} ({DAYS} dias)")
     log(f"Descargando con {WORKERS} workers...\n")
@@ -266,7 +292,7 @@ def main():
 
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
         futures = {
-            pool.submit(fetch_channel, session, c, date_from, date_to): c
+            pool.submit(fetch_channel, session, c, date_from, date_to, base, appid): c
             for c in channels
         }
         done = 0
@@ -310,9 +336,9 @@ def main():
         for f_ in failed:
             log(f"  - {f_}")
 
-    # Si TODOS fallaron, lo mas probable es token/appId caducado o invalido: fallar el job.
+    # Si TODOS fallaron, algo cambio en la API: fallar el job.
     if channels and len(failed) == len(channels):
-        log("\nERROR: todos los canales fallaron. Revisa STARTV_TOKEN y STARTV_APP_ID.")
+        log("\nERROR: todos los canales fallaron. Revisa la sesion/appId.")
         sys.exit(3)
 
 
